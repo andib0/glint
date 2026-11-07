@@ -2,6 +2,8 @@
 
 Tiny native Windows tray app for DDC/CI monitor control. Rust + raw Win32, no Electron, no runtime.
 
+**Website:** https://andib0.github.io/glint/
+
 - `glint.exe` – tray app, ~770 KB, ~2.4 MB private memory, 0% idle CPU
 - `glintctl.exe` – command line companion
 
