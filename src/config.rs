@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_TOML: &str = r#"# Glint config. Edited from the tray menu -> "Edit config...".
 # Saved automatically when you change options in the app (comments are not kept then).
 
+theme = "system"           # system, light or dark
 link_brightness = true     # brightness slider/hotkeys move every monitor together
 step = 10                  # brightness hotkey step (percent)
 show_osd = true            # on-screen popup for hotkeys
@@ -72,6 +73,7 @@ action = "toggle_panel"
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct Config {
+    pub theme: String,
     pub link_brightness: bool,
     pub step: u32,
     pub show_osd: bool,
@@ -105,6 +107,7 @@ impl Default for Config {
     /// Field fallbacks for partial files. Must not parse TOML (serde calls this).
     fn default() -> Self {
         Config {
+            theme: "system".into(),
             link_brightness: true,
             step: 10,
             show_osd: true,

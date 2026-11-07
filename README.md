@@ -4,7 +4,7 @@ Tiny native Windows tray app for DDC/CI monitor control. Rust + raw Win32, no El
 
 **Website:** https://andib0.github.io/glint/
 
-- `glint.exe` – tray app, ~770 KB, ~2.4 MB private memory, 0% idle CPU
+- `glint.exe` – tray app, ~800 KB, ~2 MB private memory, 0% idle CPU
 - `glintctl.exe` – command line companion
 
 Built and tested on 2× AOC C32G2ZE (sold as 32G2WG8), works with any DDC/CI monitor.
@@ -21,8 +21,9 @@ DDC/CI must be enabled in the monitor's own OSD (it usually is by default). The 
 
 ## Features
 
+- Follows the Windows light/dark theme (or force it with `theme = "light"` / `"dark"` in the config)
 - Panel (left-click tray): per monitor sliders for brightness, contrast, sharpness, red/green/blue gain, volume; dropdowns for colour preset, game mode, input. Only shows what each monitor actually answers.
-- Raw VCP get/set for any code, "Reset colors" (VCP 0x08)
+- Advanced section: raw VCP get/set for any code, "Reset colors" (VCP 0x08)
 - Link brightness across monitors
 - Profiles (Day / Night / Gaming / your own via "Save as"), exact restore including the hidden User RGB values
 - Global hotkeys with on-screen display

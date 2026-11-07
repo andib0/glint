@@ -1,20 +1,20 @@
-//! The control panel popup: one column per monitor with sliders/combos for every
-//! feature the monitor answers, raw VCP access, plus profiles and options.
+//! The control panel popup: one column per monitor with sliders and dropdowns
+//! for every feature the monitor answers, profiles, and options. Raw VCP access
+//! lives behind the "Advanced" disclosure to keep the default view quiet.
 
-use super::util::{hinst, rgb, wide, window_text};
+use super::theme::{self, Kind};
+use super::util::{hinst, wide, window_text};
 use crate::config::Config;
-use crate::vcp::{self, Kind};
+use crate::vcp::{self, Kind as FKind};
 use crate::worker::{Shared, Worker};
+use std::cell::RefCell;
 use std::ptr::{null, null_mut};
+use windows_sys::Win32::Foundation::SIZE;
 use windows_sys::Win32::Foundation::{HWND, RECT};
-use windows_sys::Win32::Graphics::Dwm::{
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
-};
 use windows_sys::Win32::Graphics::Gdi::{
-    COLOR_WINDOW, COLOR_WINDOWTEXT, GetSysColor, GetSysColorBrush, HFONT,
+    GetDC, GetTextExtentPoint32W, HFONT, ReleaseDC, SelectObject,
 };
-use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetCapture, GetFocus};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetCapture, GetFocus, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 pub const CLASS: &str = "GlintPanel";
@@ -24,17 +24,19 @@ const TBM_GETPOS: u32 = 0x400;
 const TBM_SETPOS: u32 = 0x405;
 const TBM_SETRANGE: u32 = 0x406;
 const TBM_SETPAGESIZE: u32 = 0x415;
+const TBM_SETTHUMBLENGTH: u32 = 0x41B;
 const TBS_NOTICKS: u32 = 0x10;
+const TBS_FIXEDLENGTH: u32 = 0x40;
 const CBS_DROPDOWNLIST: u32 = 3;
 const CB_ADDSTRING: u32 = 0x143;
 const CB_GETCURSEL: u32 = 0x147;
 const CB_SETCURSEL: u32 = 0x14E;
+const CB_SETITEMHEIGHT: u32 = 0x153;
 const CBN_SELCHANGE: u32 = 1;
-const BS_AUTOCHECKBOX: u32 = 3;
-const BM_GETCHECK: u32 = 0xF0;
-const BM_SETCHECK: u32 = 0xF1;
+const BS_OWNERDRAW: u32 = 0xB;
 const ES_AUTOHSCROLL: u32 = 0x80;
 const EM_SETCUEBANNER: u32 = 0x1501;
+const SS_RIGHT: u32 = 2;
 const SS_NOPREFIX: u32 = 0x80;
 const SS_ENDELLIPSIS: u32 = 0x4000;
 const IDOK_: u32 = 1;
@@ -44,20 +46,36 @@ const ID_LINK: u32 = 10;
 const ID_REFRESH: u32 = 11;
 const ID_SETTINGS: u32 = 12;
 const ID_SAVE: u32 = 13;
+const ID_ADVANCED: u32 = 14;
 const ID_COMBO: u32 = 1000;
 const ID_ADV_GET: u32 = 2000;
 const ID_ADV_SET: u32 = 2100;
 const ID_RESET: u32 = 2200;
 const ID_PROFILE: u32 = 3000;
-/// Static controls with ids >= this are drawn in the dim text colour.
+/// Static controls with ids above this are drawn in the muted text colour.
 pub const ID_DIM: u32 = 4000;
 
 // Layout in DIPs.
-const M: i32 = 14;
-const COLW: i32 = 310;
-const LBL: i32 = 82;
-const SLW: i32 = 186;
-const VALW: i32 = 34;
+const M: i32 = 18;
+const GAP: i32 = 28;
+const COLW: i32 = 300;
+const LBL: i32 = 84;
+const VALW: i32 = 30;
+
+thread_local! {
+    /// Separator lines painted by the panel's WM_PAINT (no App borrow needed).
+    static LINES: RefCell<Vec<RECT>> = const { RefCell::new(Vec::new()) };
+    /// Rounded frames painted behind borderless text fields.
+    static FRAMES: RefCell<Vec<RECT>> = const { RefCell::new(Vec::new()) };
+}
+
+pub fn lines() -> Vec<RECT> {
+    LINES.with(|l| l.borrow().clone())
+}
+
+pub fn frames() -> Vec<RECT> {
+    FRAMES.with(|l| l.borrow().clone())
+}
 
 pub enum Cmd {
     Hide,
@@ -66,6 +84,7 @@ pub enum Cmd {
     SaveProfile(String),
     ApplyProfile(String),
     LinkChanged(bool),
+    ToggleAdvanced,
     ConfirmInput {
         id: String,
         mon_no: usize,
@@ -96,9 +115,9 @@ struct Adv {
 }
 
 /// Rebuild the panel whenever this changes.
-pub type LayoutKey = (u64, Vec<(String, Vec<u8>)>, Vec<String>, bool);
+pub type LayoutKey = (u64, Vec<(String, Vec<u8>)>, Vec<String>, bool, bool);
 
-pub fn layout_key(s: &Shared, cfg: &Config) -> LayoutKey {
+pub fn layout_key(s: &Shared, cfg: &Config, advanced: bool) -> LayoutKey {
     let mons = s
         .monitors
         .iter()
@@ -116,6 +135,7 @@ pub fn layout_key(s: &Shared, cfg: &Config) -> LayoutKey {
         mons,
         cfg.profiles.iter().map(|p| p.name.clone()).collect(),
         s.ready,
+        advanced,
     )
 }
 
@@ -136,12 +156,11 @@ pub struct Flyout {
 }
 
 fn px(v: i32) -> i32 {
-    (v as f32 * unsafe { GetDpiForSystem() } as f32 / 96.0).round() as i32
+    theme::px(v as f32).round() as i32
 }
 
 struct Builder {
     parent: HWND,
-    font: HFONT,
     dim_next: u32,
 }
 
@@ -174,22 +193,23 @@ impl Builder {
                 hinst(),
                 null(),
             );
-            SendMessageW(hwnd, WM_SETFONT, self.font as usize, 1);
+            SendMessageW(hwnd, WM_SETFONT, theme::font() as usize, 1);
             hwnd
         }
     }
 
-    fn label(&mut self, text: &str, x: i32, y: i32, w: i32, dim: bool) -> HWND {
-        let id = if dim {
+    fn label(&mut self, text: &str, x: i32, y: i32, w: i32, muted: bool, right: bool) -> HWND {
+        let id = if muted {
             self.dim_next += 1;
             self.dim_next
         } else {
             0
         };
+        let align = if right { SS_RIGHT } else { 0 };
         self.ctl(
             "STATIC",
             text,
-            SS_NOPREFIX | SS_ENDELLIPSIS,
+            SS_NOPREFIX | SS_ENDELLIPSIS | align,
             0,
             x,
             y,
@@ -199,20 +219,42 @@ impl Builder {
         )
     }
 
-    fn button(&self, text: &str, x: i32, y: i32, w: i32, id: u32) -> HWND {
-        self.ctl("BUTTON", text, WS_TABSTOP, 0, x, y, w, 25, id)
+    #[allow(clippy::too_many_arguments)]
+    fn button(
+        &self,
+        kind: Kind,
+        on: bool,
+        text: &str,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        id: u32,
+    ) -> HWND {
+        let b = self.ctl("BUTTON", text, WS_TABSTOP | BS_OWNERDRAW, 0, x, y, w, h, id);
+        theme::make_button(b, kind, on);
+        b
     }
 
+    /// Borderless edit inside a painted rounded frame (28 DIPs tall, like buttons).
     fn edit(&self, cue: &str, x: i32, y: i32, w: i32) -> HWND {
+        FRAMES.with(|f| {
+            f.borrow_mut().push(RECT {
+                left: px(x),
+                top: px(y),
+                right: px(x + w),
+                bottom: px(y + 28),
+            })
+        });
         let h = self.ctl(
             "EDIT",
             "",
             WS_TABSTOP | ES_AUTOHSCROLL,
-            WS_EX_CLIENTEDGE,
-            x,
-            y,
-            w,
-            23,
+            0,
+            x + 8,
+            y + 6,
+            w - 16,
+            17,
             0,
         );
         let cue = wide(cue);
@@ -221,16 +263,30 @@ impl Builder {
     }
 }
 
+/// Width in DIPs of `text` in `font`.
+fn text_width(text: &str, font: HFONT) -> i32 {
+    unsafe {
+        let dc = GetDC(null_mut());
+        let old = SelectObject(dc, font);
+        let w: Vec<u16> = text.encode_utf16().collect();
+        let mut size: SIZE = std::mem::zeroed();
+        GetTextExtentPoint32W(dc, w.as_ptr(), w.len() as i32, &mut size);
+        SelectObject(dc, old);
+        ReleaseDC(null_mut(), dc);
+        (size.cx as f32 / theme::px(1.0)).ceil() as i32
+    }
+}
+
 pub fn register(proc_: WNDPROC) {
     unsafe {
         let class = wide(CLASS);
         let wc = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
+            style: CS_DROPSHADOW,
             lpfnWndProc: proc_,
             hInstance: hinst(),
             lpszClassName: class.as_ptr(),
             hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-            hbrBackground: GetSysColorBrush(COLOR_WINDOW),
             ..std::mem::zeroed()
         };
         RegisterClassExW(&wc);
@@ -238,13 +294,13 @@ pub fn register(proc_: WNDPROC) {
 }
 
 impl Flyout {
-    pub fn create(s: &Shared, cfg: &Config, font: HFONT, bold: HFONT) -> Flyout {
+    pub fn create(s: &Shared, cfg: &Config, advanced: bool, bold: HFONT) -> Flyout {
         let hwnd = unsafe {
-            let h = CreateWindowExW(
+            CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_CONTROLPARENT,
                 wide(CLASS).as_ptr(),
                 wide("Glint").as_ptr(),
-                WS_POPUP | WS_BORDER | WS_CLIPCHILDREN,
+                WS_POPUP | WS_CLIPCHILDREN,
                 0,
                 0,
                 100,
@@ -253,24 +309,17 @@ impl Flyout {
                 null_mut(),
                 hinst(),
                 null(),
-            );
-            let pref = DWMWCP_ROUND;
-            DwmSetWindowAttribute(
-                h,
-                DWMWA_WINDOW_CORNER_PREFERENCE as u32,
-                &pref as *const _ as *const _,
-                4,
-            );
-            h
+            )
         };
+        theme::style_window(hwnd);
+        FRAMES.with(|f| f.borrow_mut().clear());
         let mut b = Builder {
             parent: hwnd,
-            font,
             dim_next: ID_DIM,
         };
         let mut f = Flyout {
             hwnd,
-            key: layout_key(s, cfg),
+            key: layout_key(s, cfg, advanced),
             sliders: Vec::new(),
             combos: Vec::new(),
             advs: Vec::new(),
@@ -283,90 +332,115 @@ impl Flyout {
             width: 0,
             height: 0,
         };
+        let mut lines = Vec::new();
 
         let ncols = s.monitors.len().max(1) as i32;
-        let width = M + ncols * (COLW + M);
+        let width = 2 * M + ncols * COLW + (ncols - 1) * GAP;
         let mut col_bottom = M;
 
         if s.monitors.is_empty() {
             let msg = if s.ready {
-                "No DDC/CI monitors found. Enable DDC/CI in the monitor's OSD."
+                "No DDC/CI monitors found. Turn on DDC/CI in your monitor's menu."
             } else {
-                "Reading monitors…"
+                "Looking for monitors…"
             };
-            b.label(msg, M, M, COLW, false);
-            col_bottom = M + 30;
+            b.label(msg, M, M, COLW, true, false);
+            col_bottom = M + 26;
         }
 
         for (mi, m) in s.monitors.iter().enumerate() {
-            let x0 = M + mi as i32 * (COLW + M);
+            let x0 = M + mi as i32 * (COLW + GAP);
+            if mi > 0 {
+                let sx = x0 - GAP / 2;
+                lines.push(RECT {
+                    left: px(sx),
+                    top: px(M),
+                    right: px(sx) + 1,
+                    bottom: 0,
+                });
+            }
             let mut y = M;
             let head = b.label(
-                &format!("Monitor {}  ·  {}", mi + 1, m.model()),
+                &format!("Monitor {}", mi + 1),
                 x0,
                 y,
-                COLW,
+                COLW - 120,
+                false,
                 false,
             );
             unsafe { SendMessageW(head, WM_SETFONT, bold as usize, 1) };
-            y += 21;
-            let input = s
-                .value(&m.id, vcp::INPUT)
-                .map(|v| format!("{}  ·  ", vcp::choice_label(vcp::INPUT, v.0 & 0xFF)))
-                .unwrap_or_default();
+            if let Some((v, _)) = s.value(&m.id, vcp::INPUT) {
+                b.label(
+                    &vcp::choice_label(vcp::INPUT, v & 0xFF),
+                    x0 + COLW - 120,
+                    y,
+                    120,
+                    true,
+                    true,
+                );
+            }
+            y += 20;
             let sub = format!(
-                "{input}{}  ·  {}×{}{}",
-                m.short_id(),
+                "{}  ·  {}×{}{}",
+                m.model(),
                 m.width,
                 m.height,
                 if m.primary { "  ·  primary" } else { "" }
             );
-            b.label(&sub, x0, y, COLW, true);
-            y += 28;
+            b.label(&sub, x0, y, COLW, true, false);
+            y += 30;
 
             if !s.ready
                 && !vcp::FEATURES
                     .iter()
                     .any(|ft| s.value(&m.id, ft.code).is_some())
             {
-                b.label("Reading settings…", x0, y, COLW, true);
+                b.label("Reading settings…", x0, y, COLW, true, false);
                 y += 26;
             }
 
+            let mut had_slider = false;
             for ft in vcp::FEATURES {
                 let Some((cur, max)) = s.value(&m.id, ft.code) else {
                     continue;
                 };
                 match ft.kind {
-                    Kind::Continuous => {
-                        b.label(ft.label, x0, y + 5, LBL, false);
+                    FKind::Continuous => {
+                        had_slider = true;
+                        b.label(ft.label, x0, y + 6, LBL, false, false);
                         let tb = b.ctl(
                             "msctls_trackbar32",
                             "",
-                            WS_TABSTOP | TBS_NOTICKS,
+                            WS_TABSTOP | TBS_NOTICKS | TBS_FIXEDLENGTH,
                             0,
-                            x0 + LBL - 6,
+                            x0 + LBL - 4,
                             y,
-                            SLW + 6,
-                            28,
+                            COLW - LBL - VALW,
+                            30,
                             0,
                         );
                         unsafe {
+                            SendMessageW(tb, TBM_SETTHUMBLENGTH, px(20) as usize, 0);
                             SendMessageW(tb, TBM_SETRANGE, 1, (max.max(1) as isize) << 16);
                             SendMessageW(tb, TBM_SETPAGESIZE, 0, 10);
                             SendMessageW(tb, TBM_SETPOS, 1, cur as isize);
                         }
-                        let val = b.label(&cur.to_string(), x0 + LBL + SLW + 4, y + 5, VALW, false);
+                        let val =
+                            b.label(&cur.to_string(), x0 + COLW - VALW, y + 6, VALW, true, true);
                         f.sliders.push(Slider {
                             hwnd: tb,
                             val,
                             mon: m.id.clone(),
                             code: ft.code,
                         });
-                        y += 30;
+                        y += 32;
                     }
-                    Kind::Choice(_) => {
-                        b.label(ft.label, x0, y + 4, LBL, false);
+                    FKind::Choice(_) => {
+                        if had_slider {
+                            y += 10;
+                            had_slider = false;
+                        }
+                        b.label(ft.label, x0, y + 5, LBL, false, false);
                         let idx = f.combos.len() as u32;
                         let cb = b.ctl(
                             "COMBOBOX",
@@ -379,6 +453,8 @@ impl Flyout {
                             320,
                             ID_COMBO + idx,
                         );
+                        theme::style_native(cb);
+                        unsafe { SendMessageW(cb, CB_SETITEMHEIGHT, usize::MAX, px(22) as isize) };
                         let mut choices = vcp::choices_for(ft, Some(&m.caps));
                         let curv = (cur & 0xFF) as u8;
                         if !choices.iter().any(|c| c.0 == curv) {
@@ -401,70 +477,168 @@ impl Flyout {
                             code: ft.code,
                             values: choices.iter().map(|c| c.0).collect(),
                         });
-                        y += 32;
+                        y += 36;
                     }
                 }
             }
 
-            // Raw VCP access for anything not covered above.
-            y += 4;
-            b.label("VCP code", x0, y + 4, LBL, false);
-            let code = b.edit("0x87", x0 + LBL, y, 52);
-            let val = b.edit("value", x0 + LBL + 56, y, 52);
-            b.button("Get", x0 + LBL + 112, y - 1, 52, ID_ADV_GET + mi as u32);
-            b.button("Set", x0 + LBL + 168, y - 1, 52, ID_ADV_SET + mi as u32);
-            f.advs.push(Adv {
-                code,
-                val,
-                mon: m.id.clone(),
-            });
-            y += 31;
-            if m.caps.supports(vcp::RESTORE_COLOR) || m.caps.is_empty() {
-                b.button("Reset colors", x0 + LBL, y, 110, ID_RESET + mi as u32);
-                y += 31;
+            if advanced {
+                y += 8;
+                b.label("VCP code", x0, y + 5, LBL, false, false);
+                let code = b.edit("0x87", x0 + LBL, y, 56);
+                let val = b.edit("value", x0 + LBL + 62, y, 56);
+                b.button(
+                    Kind::Button,
+                    false,
+                    "Get",
+                    x0 + LBL + 124,
+                    y,
+                    44,
+                    28,
+                    ID_ADV_GET + mi as u32,
+                );
+                b.button(
+                    Kind::Button,
+                    false,
+                    "Set",
+                    x0 + LBL + 172,
+                    y,
+                    44,
+                    28,
+                    ID_ADV_SET + mi as u32,
+                );
+                f.advs.push(Adv {
+                    code,
+                    val,
+                    mon: m.id.clone(),
+                });
+                y += 34;
+                if m.caps.supports(vcp::RESTORE_COLOR) || m.caps.is_empty() {
+                    b.button(
+                        Kind::Button,
+                        false,
+                        "Reset colors",
+                        x0 + LBL,
+                        y,
+                        110,
+                        28,
+                        ID_RESET + mi as u32,
+                    );
+                    y += 34;
+                }
+                b.label(
+                    &format!("Id {}", m.short_id()),
+                    x0 + LBL,
+                    y,
+                    COLW - LBL,
+                    true,
+                    false,
+                );
+                y += 22;
             }
             col_bottom = col_bottom.max(y);
         }
+        for l in lines.iter_mut() {
+            l.bottom = px(col_bottom - 6);
+        }
 
-        // Shared section.
-        let mut y = col_bottom + 6;
-        f.link = b.ctl(
-            "BUTTON",
+        // Footer: profiles, then options.
+        let mut y = col_bottom + 8;
+        lines.push(RECT {
+            left: 0,
+            top: px(y),
+            right: px(width),
+            bottom: px(y) + 1,
+        });
+        y += 16;
+
+        let mut x = M;
+        for (i, name) in f.profiles.iter().enumerate() {
+            let w = (text_width(name, theme::font()) + 28).max(60);
+            if x + w > width - M {
+                x = M;
+                y += 36;
+            }
+            b.button(
+                Kind::Button,
+                false,
+                name,
+                x,
+                y,
+                w,
+                28,
+                ID_PROFILE + i as u32,
+            );
+            x += w + 8;
+        }
+        let save_w = 150 + 8 + 64;
+        if x + save_w > width - M {
+            x = M;
+            y += 36;
+        } else {
+            x = width - M - save_w;
+        }
+        f.save_edit = b.edit("New profile name", x, y, 150);
+        b.button(Kind::Button, false, "Save", x + 158, y, 64, 28, ID_SAVE);
+        y += 44;
+
+        f.link = b.button(
+            Kind::Toggle,
+            cfg.link_brightness,
             "Link brightness",
-            WS_TABSTOP | BS_AUTOCHECKBOX,
-            0,
             M,
-            y + 1,
-            150,
-            22,
+            y,
+            180,
+            28,
             ID_LINK,
         );
-        unsafe { SendMessageW(f.link, BM_SETCHECK, cfg.link_brightness as usize, 0) };
-        b.button("Refresh", width - M - 176, y, 84, ID_REFRESH);
-        b.button("Settings…", width - M - 86, y, 86, ID_SETTINGS);
-        y += 34;
-
-        b.label("Profiles", M, y + 4, LBL, false);
-        let mut x = M + LBL;
-        for (i, name) in f.profiles.iter().enumerate() {
-            let w = (name.chars().count() as i32 * 7 + 26).clamp(64, 150);
-            if x + w > width - M {
-                x = M + LBL;
-                y += 31;
-            }
-            b.button(name, x, y, w, ID_PROFILE + i as u32);
-            x += w + 6;
-        }
-        y += 33;
-        b.label("Save as", M, y + 4, LBL, false);
-        f.save_edit = b.edit("profile name", M + LBL, y, 150);
-        b.button("Save", M + LBL + 156, y - 1, 70, ID_SAVE);
+        let adv_w = text_width("Advanced", theme::font()) + 30;
+        b.button(
+            Kind::Icon,
+            false,
+            theme::GLYPH_SETTINGS,
+            width - M - 32,
+            y,
+            32,
+            28,
+            ID_SETTINGS,
+        );
+        b.button(
+            Kind::Icon,
+            false,
+            theme::GLYPH_REFRESH,
+            width - M - 68,
+            y,
+            32,
+            28,
+            ID_REFRESH,
+        );
+        b.button(
+            Kind::Disclosure,
+            advanced,
+            "Advanced",
+            width - M - 76 - adv_w,
+            y,
+            adv_w,
+            28,
+            ID_ADVANCED,
+        );
         y += 32;
-        f.status = b.label("", M, y, width - 2 * M, true);
-        y += 22;
+        f.status = b.label("", M, y + 4, width - 2 * M, true, false);
+        y += 24;
 
-        f.width = px(width) + 2;
-        f.height = px(y + M - 6) + 2;
+        LINES.with(|l| *l.borrow_mut() = lines);
+        f.width = px(width);
+        f.height = px(y + M - 10);
+        unsafe {
+            // hide focus rectangles until the keyboard is used
+            SendMessageW(
+                hwnd,
+                WM_CHANGEUISTATE,
+                (UIS_SET | (UISF_HIDEFOCUS << 16)) as usize,
+                0,
+            );
+        }
         f.update(s);
         f
     }
@@ -533,7 +707,7 @@ impl Flyout {
                 Ok((cur, max)) => {
                     set_text(self.advs[i].val, &cur.to_string());
                     self.status_note = Some(format!(
-                        "Monitor {} VCP 0x{code:02X} = {cur} (max {max})",
+                        "Monitor {}: VCP 0x{code:02X} = {cur} (max {max})",
                         i + 1
                     ));
                 }
@@ -545,10 +719,10 @@ impl Flyout {
             self.adv_pending = None;
         }
         let status = match (&s.last_error, &self.status_note) {
-            (Some(e), _) => format!("⚠ {e}"),
+            (Some(e), _) => e.clone(),
             (None, Some(n)) => n.clone(),
             (None, None) if !s.ready => "Reading monitors…".into(),
-            _ => "Hotkeys, profiles and schedule: Settings…".into(),
+            _ => String::new(),
         };
         set_text(self.status, &status);
     }
@@ -578,9 +752,12 @@ impl Flyout {
         match id {
             IDCANCEL_ => Some(Cmd::Hide),
             IDOK_ if unsafe { GetFocus() } == self.save_edit => self.save_cmd(),
-            ID_LINK => Some(Cmd::LinkChanged(
-                unsafe { SendMessageW(self.link, BM_GETCHECK, 0, 0) } == 1,
-            )),
+            ID_LINK => {
+                let on = !theme::is_on(self.link);
+                theme::set_on(self.link, on);
+                Some(Cmd::LinkChanged(on))
+            }
+            ID_ADVANCED => Some(Cmd::ToggleAdvanced),
             ID_REFRESH => {
                 self.status_note = None;
                 Some(Cmd::Refresh)
@@ -615,7 +792,7 @@ impl Flyout {
                         self.adv_pending = Some((i, code));
                         self.note(format!("Reading VCP 0x{code:02X}…"));
                     }
-                    None => self.note("Enter a VCP code like 0x87 or a name like contrast".into()),
+                    None => self.note("Enter a VCP code like 0x87, or a name like contrast".into()),
                 }
                 None
             }
@@ -627,7 +804,7 @@ impl Flyout {
                 match (code, val) {
                     (Some(code), Some(v)) => {
                         worker.set(&adv.mon, code, v);
-                        self.note(format!("Monitor {} VCP 0x{code:02X} ← {v}", i + 1));
+                        self.note(format!("Monitor {}: VCP 0x{code:02X} set to {v}", i + 1));
                     }
                     _ => self.note("Enter a VCP code and a value".into()),
                 }
@@ -652,7 +829,8 @@ impl Flyout {
     fn save_cmd(&mut self) -> Option<Cmd> {
         let name = window_text(self.save_edit).trim().to_string();
         if name.is_empty() {
-            self.note("Type a profile name first".into());
+            self.note("Type a name for the profile first".into());
+            unsafe { SetFocus(self.save_edit) };
             return None;
         }
         set_text(self.save_edit, "");
@@ -673,15 +851,8 @@ fn set_text(hwnd: HWND, s: &str) {
     }
 }
 
-/// Colours for WM_CTLCOLORSTATIC: (text, background).
-pub fn static_colors(ctl_id: u32) -> (u32, u32) {
-    unsafe {
-        let bg = GetSysColor(COLOR_WINDOW);
-        let fg = if ctl_id > ID_DIM {
-            rgb(110, 110, 110)
-        } else {
-            GetSysColor(COLOR_WINDOWTEXT)
-        };
-        (fg, bg)
-    }
+/// Text colour (0xRRGGBB) for a static control id.
+pub fn static_text_color(ctl_id: u32) -> u32 {
+    let t = theme::get();
+    if ctl_id > ID_DIM { t.muted } else { t.text }
 }

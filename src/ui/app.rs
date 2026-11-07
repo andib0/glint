@@ -6,7 +6,7 @@
 
 use super::flyout::{self, Flyout};
 use super::util::{hinst, hiword, log, loword, wide};
-use super::{autostart, icon, osd};
+use super::{autostart, gfx, icon, osd, theme};
 use crate::backend::MonitorInfo;
 use crate::config::{self, Action, Config};
 use crate::ddc_win::WinBackend;
@@ -20,14 +20,15 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateFontIndirectW, CreateSolidBrush, GetMonitorInfoW, HBRUSH, HDC, HFONT,
-    MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW, MonitorFromPoint, SetBkColor,
-    SetTextColor,
+    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetMonitorInfoW, HDC, HFONT,
+    MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW, MonitorFromPoint, PAINTSTRUCT,
+    SetBkColor, SetTextColor,
 };
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Controls::{
-    ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx,
+    DRAWITEMSTRUCT, ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX,
+    InitCommonControlsEx, NMCUSTOMDRAW, NMHDR,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
 use windows_sys::Win32::UI::Shell::{
@@ -51,7 +52,6 @@ thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
     static PANEL: Cell<HWND> = const { Cell::new(null_mut()) };
     static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
-    static PANEL_BRUSH: Cell<HBRUSH> = const { Cell::new(null_mut()) };
 }
 
 fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
@@ -66,8 +66,8 @@ struct App {
     cfg_mtime: Option<SystemTime>,
     panel: Option<Flyout>,
     icon: HICON,
-    font: HFONT,
     bold: HFONT,
+    advanced: bool,
     last_hide: Instant,
     last_schedule: Option<usize>,
     schedule_started: bool,
@@ -114,13 +114,15 @@ pub fn run(args: Vec<String>) -> i32 {
             hinst(),
             null(),
         );
-        let (font, bold, big) = make_fonts();
-        osd::init(big);
         let cfg_path = config::default_path();
         let (cfg, cfg_err) = match config::load_or_create(&cfg_path) {
             Ok(c) => (c, None),
             Err(e) => (Config::builtin(), Some(e)),
         };
+        gfx::startup();
+        theme::apply(&cfg.theme);
+        let (big, _font) = theme::init_fonts();
+        osd::init(big);
         let cfg_mtime = std::fs::metadata(&cfg_path).and_then(|m| m.modified()).ok();
 
         let hw = hwnd as isize;
@@ -141,8 +143,8 @@ pub fn run(args: Vec<String>) -> i32 {
             cfg_mtime,
             panel: None,
             icon: icon::make(GetSystemMetrics(SM_CXSMICON).max(16)),
-            font,
-            bold,
+            bold: theme::bold(),
+            advanced: false,
             last_hide: Instant::now() - std::time::Duration::from_secs(5),
             last_schedule: None,
             schedule_started: false,
@@ -178,26 +180,6 @@ pub fn run(args: Vec<String>) -> i32 {
         APP.with(|a| a.borrow_mut().take()); // joins the worker thread
         CloseHandle(mutex);
         0
-    }
-}
-
-unsafe fn make_fonts() -> (HFONT, HFONT, HFONT) {
-    unsafe {
-        let mut ncm: NONCLIENTMETRICSW = std::mem::zeroed();
-        ncm.cbSize = size_of::<NONCLIENTMETRICSW>() as u32;
-        SystemParametersInfoW(
-            SPI_GETNONCLIENTMETRICS,
-            ncm.cbSize,
-            &mut ncm as *mut _ as *mut _,
-            0,
-        );
-        let mut lf = ncm.lfMessageFont;
-        let normal = CreateFontIndirectW(&lf);
-        lf.lfWeight = 600;
-        let bold = CreateFontIndirectW(&lf);
-        lf.lfHeight = lf.lfHeight * 3 / 2;
-        let big = CreateFontIndirectW(&lf);
-        (normal, bold, big)
     }
 }
 
@@ -307,6 +289,8 @@ impl App {
         match config::load_or_create(&self.cfg_path) {
             Ok(c) if c != self.cfg => {
                 self.cfg = c;
+                theme::apply(&self.cfg.theme);
+                self.rebuild_panel();
                 self.register_hotkeys();
                 self.last_schedule = None;
                 self.refresh_panel();
@@ -497,7 +481,7 @@ impl App {
 
     /// Rebuild the panel if monitors/features/profiles changed. Returns true if rebuilt.
     fn ensure_panel(&mut self) -> bool {
-        let key = flyout::layout_key(&self.worker.lock(), &self.cfg);
+        let key = flyout::layout_key(&self.worker.lock(), &self.cfg, self.advanced);
         if self.panel.as_ref().is_some_and(|p| p.key == key) {
             return false;
         }
@@ -506,7 +490,7 @@ impl App {
             PANEL.set(null_mut());
             old.destroy();
         }
-        let p = Flyout::create(&self.worker.lock(), &self.cfg, self.font, self.bold);
+        let p = Flyout::create(&self.worker.lock(), &self.cfg, self.advanced, self.bold);
         PANEL.set(p.hwnd);
         p.place();
         self.panel = Some(p);
@@ -514,6 +498,19 @@ impl App {
             self.show_window();
         }
         true
+    }
+
+    /// Throw the panel away (theme change); rebuilt now if it was open, else on next show.
+    fn rebuild_panel(&mut self) {
+        let was_visible = self.panel_visible();
+        if let Some(old) = self.panel.take() {
+            PANEL.set(null_mut());
+            old.destroy();
+        }
+        if was_visible {
+            self.ensure_panel();
+            self.show_window();
+        }
     }
 
     fn show_window(&self) {
@@ -752,6 +749,13 @@ fn run_panel_cmd(cmd: flyout::Cmd) {
         Cmd::ApplyProfile(name) => {
             with_app(|a| a.apply_profile(&name));
         }
+        Cmd::ToggleAdvanced => {
+            with_app(|a| {
+                a.advanced = !a.advanced;
+                a.ensure_panel();
+                a.show_window();
+            });
+        }
         Cmd::LinkChanged(on) => {
             with_app(|a| {
                 a.cfg.link_brightness = on;
@@ -854,6 +858,24 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 PostQuitMessage(0);
                 0
             }
+            WM_SETTINGCHANGE => {
+                if lp != 0 {
+                    let p = lp as *const u16;
+                    let mut n = 0;
+                    while n < 64 && *p.add(n) != 0 {
+                        n += 1;
+                    }
+                    let name = String::from_utf16_lossy(std::slice::from_raw_parts(p, n));
+                    if name == "ImmersiveColorSet" {
+                        with_app(|a| {
+                            if theme::apply(&a.cfg.theme) {
+                                a.rebuild_panel();
+                            }
+                        });
+                    }
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
             m if m != 0 && m == TASKBAR_CREATED.get() => {
                 with_app(|a| a.tray_add());
                 0
@@ -897,15 +919,56 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             }
             WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
                 let id = GetDlgCtrlID(lp as HWND) as u32;
-                let (fg, bg) = flyout::static_colors(id);
-                SetTextColor(wp as HDC, fg);
-                SetBkColor(wp as HDC, bg);
-                let mut brush = PANEL_BRUSH.get();
-                if brush.is_null() {
-                    brush = CreateSolidBrush(bg);
-                    PANEL_BRUSH.set(brush);
+                SetTextColor(wp as HDC, theme::cref(flyout::static_text_color(id)));
+                SetBkColor(wp as HDC, theme::cref(theme::get().bg));
+                theme::bg_brush() as LRESULT
+            }
+            WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
+                SetTextColor(wp as HDC, theme::cref(theme::get().text));
+                SetBkColor(wp as HDC, theme::cref(theme::get().surface));
+                theme::surface_brush() as LRESULT
+            }
+            WM_ERASEBKGND => {
+                let mut rc = std::mem::zeroed();
+                GetClientRect(hwnd, &mut rc);
+                FillRect(wp as HDC, &rc, theme::bg_brush());
+                1
+            }
+            WM_PAINT => {
+                let mut ps: PAINTSTRUCT = std::mem::zeroed();
+                let hdc = BeginPaint(hwnd, &mut ps);
+                let line = CreateSolidBrush(theme::cref(theme::get().line));
+                for r in flyout::lines() {
+                    FillRect(hdc, &r, line);
                 }
-                brush as LRESULT
+                DeleteObject(line);
+                let frames = flyout::frames();
+                if !frames.is_empty()
+                    && let Some(cv) = gfx::Canvas::new(hdc)
+                {
+                    let t = theme::get();
+                    let r = theme::px(5.0);
+                    for f in frames {
+                        let (x, y) = (f.left as f32, f.top as f32);
+                        let (w, h) = ((f.right - f.left) as f32, (f.bottom - f.top) as f32);
+                        cv.fill_round(x, y, w, h, r, t.surface);
+                        cv.stroke_round(x, y, w, h, r, t.line, 1.0);
+                    }
+                }
+                EndPaint(hwnd, &ps);
+                0
+            }
+            WM_DRAWITEM => {
+                theme::draw_button(&*(lp as *const DRAWITEMSTRUCT));
+                1
+            }
+            WM_NOTIFY => {
+                let hdr = &*(lp as *const NMHDR);
+                // NM_CUSTOMDRAW (-12) from a trackbar
+                if hdr.code == 0xFFFF_FFF4 && is_trackbar(hdr.hwndFrom) {
+                    return theme::draw_slider(&*(lp as *const NMCUSTOMDRAW));
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_CLOSE => {
                 with_app(|a| a.hide_panel());
@@ -914,6 +977,12 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             _ => DefWindowProcW(hwnd, msg, wp, lp),
         }
     }
+}
+
+fn is_trackbar(hwnd: HWND) -> bool {
+    let mut buf = [0u16; 32];
+    let n = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), 32) };
+    String::from_utf16_lossy(&buf[..n.max(0) as usize]).eq_ignore_ascii_case("msctls_trackbar32")
 }
 
 fn a_tip() {
