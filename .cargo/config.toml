@@ -1,0 +1,5 @@
+# Use Rust's bundled MinGW linker/CRT for the GNU target. Newer system MinGW
+# toolchains (e.g. WinLibs GCC 16) link their own default manifest, which
+# clashes with the one embedded by build.rs ("multiple non-default manifests").
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-self-contained=yes"]

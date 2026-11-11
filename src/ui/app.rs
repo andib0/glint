@@ -120,6 +120,7 @@ pub fn run(args: Vec<String>) -> i32 {
             Err(e) => (Config::builtin(), Some(e)),
         };
         gfx::startup();
+        autostart::migrate();
         theme::apply(&cfg.theme);
         let (big, _font) = theme::init_fonts();
         osd::init(big);
