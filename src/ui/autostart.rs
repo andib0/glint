@@ -1,9 +1,9 @@
 ﻿//! "Start with Windows" via a per-user Task Scheduler sign-in task.
 //!
-//! The classic HKCU\...\Run entry turned out to be unreliable on Windows 11:
-//! Explorer enumerates it at sign-in but can silently skip unsigned apps even
-//! when Settings > Apps > Startup shows them enabled. A logon task needs no
-//! admin rights and is launched by Task Scheduler regardless of that list.
+//! A logon task needs no admin rights, is launched by Task Scheduler
+//! independently of the Settings > Apps > Startup list, and is easy to verify
+//! with `schtasks /Query`. Older versions used an HKCU\...\Run entry; that is
+//! migrated to the task on startup.
 
 use super::util::wide;
 use std::os::windows::process::CommandExt;
